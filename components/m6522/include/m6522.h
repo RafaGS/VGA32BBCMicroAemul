@@ -128,7 +128,7 @@ typedef struct {
     uint16_t counter;  /* current counter value                         */
     bool     t_bit;    /* toggles on underflow (T1: PB7; T2: fired)    */
     bool     t_out;    /* true for one tick at underflow                */
-    uint8_t  pip;      /* 2-cycle count pipeline + 1-cycle load pipeline */
+    uint16_t  pip;      /* 2-cycle count pipeline + 1-cycle load pipeline */
 } m6522_timer_t;
 
 /* --------------------------------------------------------------------------

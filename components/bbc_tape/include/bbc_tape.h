@@ -2,7 +2,7 @@
  * bbc_tape.h — BBC Micro tape interface emulation
  *
  * Emulates:
- *   - UEF file parser (chunks 0x0100 data blocks, 0x0110 carrier, 0x0120 gap)
+ *   - UEF parser (0x0100 data, 0x0104 8N1 data, 0x0110/0x0111 carrier)
  *   - Serial ULA / ACIA (MC6850-compatible) at $FE08-$FE09
  *   - Tape motor control via callback
  *
@@ -33,7 +33,9 @@
  * ------------------------------------------------------------------------- */
 #define UEF_CHUNK_ORIGIN      0x0000
 #define UEF_CHUNK_DATA        0x0100  /* tape data block */
+#define UEF_CHUNK_FORMAT_DATA 0x0104  /* data with explicit framing */
 #define UEF_CHUNK_CARRIER     0x0110  /* carrier tone */
+#define UEF_CHUNK_CARRIER_DUMMY 0x0111 /* carrier, dummy byte, carrier */
 #define UEF_CHUNK_GAP_INT     0x0120  /* integer gap */
 #define UEF_CHUNK_GAP_FLOAT   0x0116  /* float gap */
 #define UEF_CHUNK_BAUD        0x0113  /* baud rate */
@@ -57,7 +59,7 @@ typedef struct {
     uint8_t  *uef_data;
     size_t    uef_size;
 
-    /* Block list (pointers into uef_data) */
+        /* Decoded block list */
     bbc_tape_block_t *blocks;
     uint16_t          n_blocks;
     uint16_t          cur_block;   /* block being read */

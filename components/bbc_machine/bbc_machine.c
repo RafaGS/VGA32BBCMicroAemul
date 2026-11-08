@@ -1,5 +1,5 @@
 /*
- * bbc_machine.c — BBC Micro Model B top-level integration
+ * bbc_machine.c — BBC Micro top-level integration
  *
  * Licence: zlib
  * Copyright (c) 2026 esp-beep project
@@ -9,6 +9,28 @@
 #include "bbc_tape.h"
 #include <string.h>
 #include <stdio.h>
+
+#if defined(BBC_MACHINE_PROFILE)
+#include <stdint.h>
+
+static inline uint32_t machine_profile_ccount(void)
+{
+    uint32_t count;
+    __asm__ __volatile__("rsr %0, ccount" : "=a"(count));
+    return count;
+}
+
+//static uint32_t mp_divider = 0;
+static uint32_t mp_rng = 0xA341316Cu;
+static uint64_t mp_total = 0;
+
+static uint32_t mp_samples = 0;
+
+static uint64_t mp_cpu = 0;
+static uint64_t mp_sysvia = 0;
+static uint64_t mp_tape = 0;
+static uint64_t mp_video = 0;
+#endif
 
 /* ======================================================================
  * Forward declarations for static callback functions
@@ -20,26 +42,12 @@ static bool     sv_keyboard_read(void *ctx, uint8_t row, uint8_t col);
 static void     sv_latch_changed(void *ctx, uint8_t latch_bits);
 static void     sv_irq          (void *ctx, bool state);
 
-/* uservia callbacks */
-static void     uv_port_out(void *ctx, uint8_t port, uint8_t val, uint8_t ddr);
-static uint8_t  uv_port_in (void *ctx, uint8_t port);
-static void     uv_irq     (void *ctx, bool state);
-
-/* wd1770 callbacks */
-static void     fdc_irq(void *ctx, bool state);
-static void     fdc_drq(void *ctx, bool state);
-
 /* tape callbacks and IO handlers */
 static void     tape_irq        (void *ctx, bool state);
 static void     sv_motor_changed(void *ctx, bool on);
 static uint8_t  io_acia_read        (uint16_t addr, void *ctx);
 static void     io_acia_write       (uint16_t addr, uint8_t val, void *ctx);
 static void     io_serial_ula_write (uint16_t addr, uint8_t val, void *ctx);
-
-/* wd1770 disk I/O wrappers (forward to m->disk_* callbacks) */
-static int      fdc_read_sector (void *ctx, uint8_t drive, uint8_t track, uint8_t sector, uint8_t side, uint8_t density, uint8_t *buf, uint16_t *len);
-static int      fdc_write_sector(void *ctx, uint8_t drive, uint8_t track, uint8_t sector, uint8_t side, uint8_t density, bool deleted, const uint8_t *buf, uint16_t len);
-static void     fdc_seek        (void *ctx, uint8_t drive, uint8_t track);
 
 /* video vsync callback */
 static void     video_vsync_cb(void *ctx, bool state);
@@ -51,22 +59,14 @@ static uint8_t  io_vidproc_read  (uint16_t addr, void *ctx);
 static void     io_vidproc_write (uint16_t addr, uint8_t val, void *ctx);
 static uint8_t  io_sysvia_read   (uint16_t addr, void *ctx);
 static void     io_sysvia_write  (uint16_t addr, uint8_t val, void *ctx);
-static uint8_t  io_uservia_read  (uint16_t addr, void *ctx);
-static void     io_uservia_write (uint16_t addr, uint8_t val, void *ctx);
-static uint8_t  io_fdc_read      (uint16_t addr, void *ctx);
-static void     io_fdc_write     (uint16_t addr, uint8_t val, void *ctx);
-static uint8_t  io_romsel_read   (uint16_t addr, void *ctx);
-static void     io_romsel_write  (uint16_t addr, uint8_t val, void *ctx);
 
 /* ======================================================================
  * IRQ helpers
  * ====================================================================== */
 
-/* Recalculate the CPU /IRQ line from all sources.
- * All IRQ sources (sysvia, uservia, ACIA) share the same /IRQ line.
- * The line is asserted (low) if ANY source is active. */
+/* Recalculate the CPU /IRQ line from System VIA and ACIA. */
 static void update_irq(bbc_machine_t *m) {
-    if (m->irq.sysvia || m->irq.uservia || m->irq.acia) {
+    if (m->irq.sysvia || m->irq.acia) {
         bbc_cpu_irq(m->cpu);
     } else {
         bbc_cpu_clear_irq(m->cpu);
@@ -92,10 +92,11 @@ void bbc_machine_init(bbc_machine_t *m,
     /* The CPU read/write callbacks just call through to bbc_memory.    */
     /* We store m itself as userData so the wrappers can access m->mem. */
     m->cpu = bbc_cpu_create(
-        /* read  */ bbc_memory_read,
-        /* write */ bbc_memory_write,
-        /* ctx   */ m->mem
-    );
+            /* read  */ bbc_memory_read,
+            /* write */ bbc_memory_write,
+            /* ctx   */ m->mem
+            );
+
 
     /* ----- System VIA ---------------------------------------------- */
     {
@@ -110,34 +111,6 @@ void bbc_machine_init(bbc_machine_t *m,
         bbc_sysvia_init(&m->sysvia, &cb);
     }
 
-    /* ----- User VIA ------------------------------------------------- */
-    {
-        bbc_uservia_callbacks_t cb = {
-            .port_out = uv_port_out,
-            .port_in  = uv_port_in,
-            .irq      = uv_irq,
-            .user_ctx = m,
-        };
-        bbc_uservia_init(&m->uservia, &cb);
-    }
-
-    /* ----- WD1770 FDC ---------------------------------------------- */
-    /* IMPORTANT: user_ctx is always 'm' so that fdc_irq / fdc_drq can
-     * safely cast ctx to bbc_machine_t*.  Disk I/O callbacks are stored
-     * separately in m->disk_* and forwarded via fdc_read_sector et al.
-     * Never replace user_ctx — use bbc_machine_mount_disk() instead. */
-    {
-        wd1770_callbacks_t cb = {
-            .read_sector  = fdc_read_sector,
-            .write_sector = fdc_write_sector,
-            .seek         = fdc_seek,
-            .irq          = fdc_irq,
-            .drq          = fdc_drq,
-            .user_ctx     = m,
-        };
-        wd1770_init(&m->fdc, &cb);
-    }
-
     /* ----- Tape (ACIA / Serial ULA) --------------------------------- */
     bbc_tape_init(&m->tape);
     bbc_tape_set_irq_cb(&m->tape, tape_irq, m);
@@ -148,7 +121,7 @@ void bbc_machine_init(bbc_machine_t *m,
     /* ----- Video ---------------------------------------------------- */
     {
         uint8_t *ram = bbc_memory_get_ram(m->mem);
-        bbc_video_init(&m->video, ram, 32768);
+        bbc_video_init(&m->video, ram, BBC_MEMORY_RAM_SIZE);
         bbc_video_set_vsync_callback(&m->video, video_vsync_cb, m);
     }
 
@@ -166,27 +139,6 @@ void bbc_machine_init(bbc_machine_t *m,
     bbc_memory_set_range_callbacks(m->mem, 0xFE40, 16,
         io_sysvia_read, io_sysvia_write, m);
 
-    /* User VIA: &FE60–&FE6F */
-    bbc_memory_set_range_callbacks(m->mem, 0xFE60, 16,
-        io_uservia_read, io_uservia_write, m);
-
-    /* WD1770 FDC: &FE80–&FE87
-     * The WD1770 chip select on the Acorn 1770 board ignores A2, so the four
-     * chip registers at &FE80-&FE83 mirror at &FE84-&FE87 — except that
-     * &FE84 is intercepted by the external drive-select latch before reaching
-     * the chip.  The DFS ROM accesses:
-     *   &FE80 command/status   (and mirrors at &FE84 — but &FE84 is the latch)
-     *   &FE85 track reg        mirror of &FE81
-     *   &FE86 sector reg       mirror of &FE82
-     *   &FE87 data reg         mirror of &FE83
-     */
-    bbc_memory_set_range_callbacks(m->mem, 0xFE80, 8,
-        io_fdc_read, io_fdc_write, m);
-
-    /* ROMSEL: &FE30 (write selects sideways ROM slot; read returns current slot) */
-    bbc_memory_set_read_callback (m->mem, 0xFE30, io_romsel_read,  m);
-    bbc_memory_set_write_callback(m->mem, 0xFE30, io_romsel_write, m);
-
     /* MC6850 ACIA: &FE08 (status/ctrl) &FE09 (data) */
     bbc_memory_set_range_callbacks(m->mem, 0xFE08, 2,
         io_acia_read, io_acia_write, m);
@@ -200,36 +152,21 @@ void bbc_machine_init(bbc_machine_t *m,
 }
 
 /* ======================================================================
- * bbc_machine_load_sideways_rom
- * ====================================================================== */
-
-void bbc_machine_load_sideways_rom(bbc_machine_t *m,
-                                    const uint8_t *rom_data, uint32_t rom_size,
-                                    uint8_t slot) {
-    bbc_memory_load_sideways_rom(m->mem, rom_data, rom_size, slot);
-}
-
-/* ======================================================================
  * bbc_machine_reset
  * ====================================================================== */
 
 void bbc_machine_reset(bbc_machine_t *m) {
     bbc_sysvia_reset(&m->sysvia);
-    bbc_uservia_reset(&m->uservia);
-    wd1770_reset(&m->fdc);
     sn76489_reset(&m->psg);
     bbc_video_reset(&m->video);
 
     m->irq.sysvia  = false;
-    m->irq.uservia = false;
     m->irq.acia    = false;
-    m->cycle_acc   = 0;
+    m->sysvia_acc  = 0;
+    m->crtc_acc    = 0;
 
     if (m->fb_output) {
         bbc_video_set_output(&m->video, m->fb_output);
-    }
-    if (m->on_frame) {
-        bbc_video_set_frame_callback(&m->video, m->on_frame, m->on_frame_ctx);
     }
     if (m->on_frame) {
         bbc_video_set_frame_callback(&m->video, m->on_frame, m->on_frame_ctx);
@@ -243,37 +180,26 @@ void bbc_machine_reset(bbc_machine_t *m) {
  *
  * Soft BREAK: reset CPU + peripherals without clearing RAM.
  *
- * On real BBC hardware the BREAK key pulls /RESET low for ~200 ms.
- * The OS reset handler reads $FE4E (VIA IER) to distinguish BREAK from
- * power-on, then reads $0258 to detect Ctrl-BREAK.  What matters for the
- * DFS banner is that ZP $EF survives (it is set to 'D'/0x44 by the DFS
- * workspace-init code during the first reset, so on subsequent BREAKs the
- * DFS can see it and print its banner).
- *
- * We also write $0258 bit 1 to communicate shift_held so the OS can tell
- * the DFS to autoboot (SHIFT+BREAK).
+ * The OS reads $0258 to distinguish BREAK-key modifiers. Preserve RAM,
+ * record whether Shift is held, and reset the installed hardware.
  * ====================================================================== */
 
 void bbc_machine_break(bbc_machine_t *m, bool shift_held) {
     uint8_t *ram = bbc_memory_get_ram(m->mem);
 
-    /* $0258: BBC OS "break key state" — bit 0 = Ctrl held, bit 1 = Shift held.
-     * The DFS reads this to decide whether to autoboot. */
+    /* $0258: BBC OS BREAK-key state — bit 1 indicates Shift. */
     if (ram) {
         ram[0x0258] = shift_held ? 0x02 : 0x00;
     }
 
     /* Reset peripherals (preserves RAM) */
     bbc_sysvia_reset(&m->sysvia);
-    bbc_uservia_reset(&m->uservia);
-    wd1770_reset(&m->fdc);
     sn76489_reset(&m->psg);
     bbc_video_reset(&m->video);
 
     m->irq.sysvia  = false;
-    m->irq.uservia = false;
     m->irq.acia    = false;
-    m->cycle_acc   = 0;
+    m->sysvia_acc  = 0;
     m->crtc_acc    = 0;
 
     if (m->fb_output) {
@@ -291,68 +217,102 @@ void bbc_machine_break(bbc_machine_t *m, bool shift_held) {
  * ====================================================================== */
 
 int bbc_machine_step(bbc_machine_t *m) {
-    /* PC watchdog: print PC every ~2M cycles so we can see where it's spinning */
-    static int32_t watchdog_cycles = 0;
-    static uint16_t last_reported_pc = 0xFFFF; (void)last_reported_pc;
-    watchdog_cycles--;
-    if (watchdog_cycles <= 0) {
-        watchdog_cycles = 2000000;
-        uint16_t pc = bbc_cpu_get_pc(m->cpu);
-        uint8_t *ram = bbc_memory_get_ram(m->mem);
-        uint8_t acia_st = bbc_tape_read(&m->tape, 0); /* read ACIA status non-destructively */
-        fprintf(stderr, "[wdog] PC=$%04X C2=$%02X EA=$%02X 0250=$%02X 0278=$%02X ACIA_st=%02X irq(sv=%d uv=%d ac=%d) block=%d/%d\n",
-                pc,
-                ram ? ram[0xC2] : 0xFF,
-                ram ? ram[0xEA] : 0xFF,
-                ram ? ram[0x0250] : 0xFF, /* $0250 = ACIA control shadow */
-                ram ? ram[0x0278] : 0xFF, /* $0278 tape/serial config */
-                acia_st,
-                m->irq.sysvia, m->irq.uservia, m->irq.acia,
-                m->tape.cur_block, m->tape.n_blocks);
-        (void)acia_st;
-        last_reported_pc = pc;
+#if defined(BBC_MACHINE_PROFILE)
+    /* Muestreo pseudoaleatorio: aproximadamente 1 de cada 64 pasos. */
+    mp_rng = mp_rng * 1664525u + 1013904223u;
+    const int mp_sample = (mp_rng < 0x04000000u);
+
+    uint32_t mp_start = 0;
+    uint32_t mp_end = 0;
+    uint32_t mp_whole_start = 0;
+
+    if (mp_sample) {
+        mp_whole_start = machine_profile_ccount();
+        mp_start = mp_whole_start;
     }
+#endif
 
     int cycles = bbc_cpu_step(m->cpu);
+
+#if defined(BBC_MACHINE_PROFILE)
+    if (mp_sample) {
+        mp_end = machine_profile_ccount();
+        mp_cpu += (uint32_t)(mp_end - mp_start);
+        mp_start = mp_end;
+    }
+#endif
+
     if (cycles <= 0) cycles = 1;
 
-    bbc_sysvia_tick (&m->sysvia,  cycles);
-    bbc_uservia_tick(&m->uservia, cycles);
-    wd1770_tick     (&m->fdc,     cycles);
+    /* The VIA is clocked at 1 MHz while the CPU is nominally 2 MHz.
+     * Instruction-granularity CPU stepping makes this an approximation,
+     * not bus-cycle or wait-state accurate. */
+    m->sysvia_acc += cycles;
+    int32_t sysvia_ticks = m->sysvia_acc / 2;
+    m->sysvia_acc %= 2;
+    if (sysvia_ticks > 0)
+        bbc_sysvia_tick(&m->sysvia, sysvia_ticks);
+
+#if defined(BBC_MACHINE_PROFILE)
+    if (mp_sample) {
+        mp_end = machine_profile_ccount();
+        mp_sysvia += (uint32_t)(mp_end - mp_start);
+        mp_start = mp_end;
+    }
+#endif
+
     bbc_tape_tick   (&m->tape,    cycles);
 
-    /* Tick CRTC at 1 MHz (= CPU / 2).  bbc_video_tick() generates VSYNC
-     * which drives the MOS frame IRQ via System VIA CA1.  Without this the
-     * keyboard scanner in the MOS never runs.
-     * Use a sub-cycle accumulator to approximate the 2:1 ratio. */
-    m->crtc_acc += cycles;
-    while (m->crtc_acc >= 2) {
-        bbc_video_tick(&m->video);
-        m->crtc_acc -= 2;
+#if defined(BBC_MACHINE_PROFILE)
+    if (mp_sample) {
+        mp_end = machine_profile_ccount();
+        mp_tape += (uint32_t)(mp_end - mp_start);
+        mp_start = mp_end;
     }
+#endif
+
+    /* The ULA selects 1 MHz (CPU/2) or 2 MHz (one tick per CPU cycle).
+     * Carry the residual cycles across instructions and clock changes. */
+
+#if defined(BBC_MACHINE_PROFILE)
+    if (mp_sample)
+        mp_start = machine_profile_ccount();
+#endif
+
+    const int32_t crtc_divisor = m->video.ula.crtc_2mhz ? 1 : 2;
+    m->crtc_acc += cycles;
+    while (m->crtc_acc >= crtc_divisor) {
+        bbc_video_tick(&m->video);
+        m->crtc_acc -= crtc_divisor;
+    }
+
+#if defined(BBC_MACHINE_PROFILE)
+    if (mp_sample) {
+        mp_end = machine_profile_ccount();
+        mp_video += (uint32_t)(mp_end - mp_start);
+        mp_total += (uint32_t)(mp_end - mp_whole_start);
+        if (++mp_samples >= 4096U) {
+            fprintf(stderr,
+                    "[machine-prof] avg CC/step"
+                    " TOTAL=%llu CPU=%llu SYSVIA=%llu"
+                    " TAPE=%llu VIDEO=%llu n=%u\n",
+                    (unsigned long long)(mp_total / mp_samples),
+                    (unsigned long long)(mp_cpu / mp_samples),
+                    (unsigned long long)(mp_sysvia / mp_samples),
+                    (unsigned long long)(mp_tape / mp_samples),
+                    (unsigned long long)(mp_video / mp_samples),
+                    (unsigned)mp_samples);
+            mp_cpu = mp_sysvia = 0;
+            mp_tape = mp_video = 0;
+            mp_samples = 0;
+            mp_total = 0;
+        }
+    }
+#endif
 
     /* SN76489 ticking is handled by sn76489_audio_push() / sn76489_render() */
 
     return cycles;
-}
-
-/* ======================================================================
- * bbc_machine_mount_disk
- * ====================================================================== */
-
-void bbc_machine_mount_disk(bbc_machine_t *m, uint8_t drive,
-    int  (*read_sector) (void *, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t *, uint16_t *),
-    int  (*write_sector)(void *, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, bool, const uint8_t *, uint16_t),
-    void (*seek)        (void *, uint8_t, uint8_t),
-    void *disk_ctx) {
-    (void)drive; /* wd1770 callbacks are chip-global; drive is passed per command */
-    /* Store disk I/O callbacks in the machine struct.  The FDC wrapper
-     * functions (fdc_read_sector et al.) forward to these.  We do NOT
-     * touch fdc.cb.user_ctx — that always points to 'm'. */
-    m->disk_read_sector  = read_sector;
-    m->disk_write_sector = write_sector;
-    m->disk_seek         = seek;
-    m->disk_ctx          = disk_ctx;
 }
 
 /* ======================================================================
@@ -394,20 +354,12 @@ void bbc_machine_set_frame_callback(bbc_machine_t *m,
  * System VIA callbacks
  * ====================================================================== */
 
-/*
- * IC32 latch bit 0 (SOUND_WE) going LOW means "write to SN76489".
- * The data byte is the current value of system VIA port A.
- */
 static void sv_latch_changed(void *ctx, uint8_t latch_bits) {
     bbc_machine_t *m = (bbc_machine_t *)ctx;
-    if (!(latch_bits & (1u << BBC_LATCH_SOUND_WE))) {
-        /* SOUND_WE is active-LOW — write port-A data to PSG */
-        uint8_t pa = bbc_sysvia_get_latch(&m->sysvia);
-        /* Actually port A data is the keyboard/sound data bus */
-        uint8_t pa_data = m6522_get_port_a(&m->sysvia.via);
-        sn76489_write(&m->psg, pa_data);
-        (void)pa;
-    }
+    bbc_video_set_scroll_control(
+        &m->video,
+        (latch_bits & (1u << BBC_LATCH_VIDEO_C0)) != 0,
+        (latch_bits & (1u << BBC_LATCH_VIDEO_C1)) != 0);
 }
 
 static void sv_sound_write(void *ctx, uint8_t data) {
@@ -431,97 +383,6 @@ static void sv_irq(void *ctx, bool state) {
     bbc_machine_t *m = (bbc_machine_t *)ctx;
     m->irq.sysvia = state;
     update_irq(m);
-}
-
-/* ======================================================================
- * User VIA callbacks
- * ====================================================================== */
-
-static void uv_port_out(void *ctx, uint8_t port, uint8_t val, uint8_t ddr) {
-    /* User port — printer / RS423 / joystick buttons; stub for now */
-    (void)ctx; (void)port; (void)val; (void)ddr;
-}
-
-static uint8_t uv_port_in(void *ctx, uint8_t port) {
-    /* Pull-ups → 0xFF when nothing connected */
-    (void)ctx; (void)port;
-    return 0xFF;
-}
-
-static void uv_irq(void *ctx, bool state) {
-    bbc_machine_t *m = (bbc_machine_t *)ctx;
-    m->irq.uservia = state;
-    update_irq(m);
-}
-
-/* ======================================================================
- * WD1770 callbacks
- * ====================================================================== */
-
-static void fdc_irq(void *ctx, bool state) {
-    bbc_machine_t *m = (bbc_machine_t *)ctx;
-    fprintf(stderr, "[fdc] INTRQ %s (cpu=%p)\n", state ? "assert" : "clear", (void*)m->cpu);
-    if (state) {
-        bbc_cpu_nmi(m->cpu);
-    }
-}
-
-static void fdc_drq(void *ctx, bool state) {
-    /*
-     * On the Acorn 1770 FDC board, DRQ is latched in an external flip-flop
-     * and becomes readable at &FE84 bit 7 (active LOW: 0 = DRQ active).
-     * The DFS NMI handler reads &FE84 to decide whether the NMI was caused
-     * by INTRQ (command done) or DRQ (data byte ready):
-     *   &FE84 bit 7 = 0 → DRQ active  → read/write next data byte
-     *   &FE84 bit 7 = 1 → INTRQ only  → command finished
-     * We track DRQ state so io_fdc_read() can return the correct value.
-     * DRQ also triggers NMI on the BBC 1770 interface board.
-     */
-    bbc_machine_t *m = (bbc_machine_t *)ctx;
-    fprintf(stderr, "[fdc] DRQ %s\n", state ? "assert" : "clear");
-    m->fdc_drq_state = state;
-    if (state) {
-        bbc_cpu_nmi(m->cpu);
-    }
-}
-
-/* ======================================================================
- * WD1770 disk I/O wrappers
- *
- * These are always installed as the FDC's read/write/seek callbacks.
- * ctx == m (bbc_machine_t *) always — safe to dereference.
- * The actual disk-image callbacks are stored in m->disk_* and called
- * with m->disk_ctx, which may be NULL if no disk is mounted.
- * ====================================================================== */
-
-static int fdc_read_sector(void *ctx,
-                            uint8_t drive, uint8_t track, uint8_t sector,
-                            uint8_t side, uint8_t density,
-                            uint8_t *buf, uint16_t *len)
-{
-    bbc_machine_t *m = (bbc_machine_t *)ctx;
-    if (!m->disk_read_sector) return -1;
-    return m->disk_read_sector(m->disk_ctx,
-                               drive, track, sector, side, density, buf, len);
-}
-
-static int fdc_write_sector(void *ctx,
-                             uint8_t drive, uint8_t track, uint8_t sector,
-                             uint8_t side, uint8_t density, bool deleted,
-                             const uint8_t *buf, uint16_t len)
-{
-    bbc_machine_t *m = (bbc_machine_t *)ctx;
-    if (!m->disk_write_sector) return -1;
-    return m->disk_write_sector(m->disk_ctx,
-                                drive, track, sector, side, density, deleted,
-                                buf, len);
-}
-
-static void fdc_seek(void *ctx, uint8_t drive, uint8_t track)
-{
-    bbc_machine_t *m = (bbc_machine_t *)ctx;
-    if (m->disk_seek)
-        m->disk_seek(m->disk_ctx, drive, track);
 }
 
 /* ======================================================================
@@ -570,119 +431,6 @@ static uint8_t io_sysvia_read(uint16_t addr, void *ctx) {
 static void io_sysvia_write(uint16_t addr, uint8_t val, void *ctx) {
     bbc_machine_t *m = (bbc_machine_t *)ctx;
     bbc_sysvia_write(&m->sysvia, (uint8_t)(addr & 0x0F), val);
-}
-
-/* User VIA IC69 — &FE60–&FE6F */
-static uint8_t io_uservia_read(uint16_t addr, void *ctx) {
-    bbc_machine_t *m = (bbc_machine_t *)ctx;
-    return bbc_uservia_read(&m->uservia, (uint8_t)(addr & 0x0F));
-}
-static void io_uservia_write(uint16_t addr, uint8_t val, void *ctx) {
-    bbc_machine_t *m = (bbc_machine_t *)ctx;
-    bbc_uservia_write(&m->uservia, (uint8_t)(addr & 0x0F), val);
-}
-
-/*
- * WD1770 FDC — Acorn 1770 board address decode (BBC Model B daughter board)
- *
- * Matches b-em FDC_ACORN decode exactly (src/wd1770.c):
- *
- *   addr & 0x04 == 0  ($FE80–$FE83): drive-select / control latch (write)
- *                                     reads return floating bus (0xFF)
- *   addr & 0x04 != 0  ($FE84–$FE87): WD1770 chip registers (read/write)
- *
- * Control latch ($FE80) bits — b-em wd1770_wctl_acorn():
- *   bit 1 = drive select  (0=drive 0, 1=drive 1)
- *   bit 2 = side select   (0=side 0, 1=side 1)
- *   bit 3 = density       (0=FM/single, 1=MFM/double)  [b-em inverts: 1→FM]
- *   bit 5 = /reset        (active LOW; 0 resets chip)
- *
- * WD1770 chip registers at $FE84–$FE87 (reg = addr & 0x03):
- *   0 = command (write) / status (read)  — reading clears INTRQ
- *   1 = track register
- *   2 = sector register
- *   3 = data register
- *
- * The NMI handler ($0D00, copied from ROM $8FD2) reads $FE84 to check
- * DRQ (bit 7 of the external latch on the real board).  We model this
- * as: reading $FE84 (reg 0, status) clears INTRQ AND returns a synthetic
- * DRQ bit so the NMI handler routes correctly.
- *
- * Note: the DFS ROM detects the chip at $9104 (STA/CMP $FE85 = track reg)
- * then reads $FE80 at $9115 expecting non-zero to confirm a disc is spinning.
- * In b-em $FE80 reads as floating bus (0xFF); AND #$03 = 0x03 ≠ 0, passes.
- * We return 0xFF for all latch reads to match this behaviour.
- */
-static uint8_t io_fdc_read(uint16_t addr, void *ctx) {
-    bbc_machine_t *m = (bbc_machine_t *)ctx;
-    uint16_t pc = bbc_cpu_get_pc(m->cpu);
-
-    if (!(addr & 0x04)) {
-        /* $FE80–$FE83: latch area — floating bus on real hardware.
-         * Return 0xFF so the DFS detect (LDA $FE80 / AND #$03) sees
-         * a non-zero value and concludes a disc is spinning. */
-        fprintf(stderr, "[fdc] R $%04X(latch/float)=FF @ PC=$%04X\n", addr, pc);
-        return 0xFF;
-    }
-
-    /* $FE84–$FE87: WD1770 chip registers (reg = addr & 0x03).
-     *
-     * $FE84 reads the WD1770 status register (same as $FE80 on the chip,
-     * since A2 is ignored by the chip select).  The DFS NMI handler reads
-     * $FE84 to get the status and acknowledge INTRQ.
-     *
-     * We clear fdc->intrq here so the INDEX-pulse edge guard allows the
-     * next INDEX INTRQ to fire. */
-    uint8_t reg = addr & 0x03;
-    uint8_t r = wd1770_read(&m->fdc, reg);  /* reg 0 → status, clears INTRQ */
-    if (reg == 0) {
-        m->fdc.intrq = false;
-    }
-    static const char *rnames[] = {"status","track","sector","data"};
-    fprintf(stderr, "[fdc] R $%04X(%s)=%02X @ PC=$%04X\n",
-            addr, rnames[reg], r, pc);
-    return r;
-}
-
-static void io_fdc_write(uint16_t addr, uint8_t val, void *ctx) {
-    bbc_machine_t *m = (bbc_machine_t *)ctx;
-    uint16_t pc = bbc_cpu_get_pc(m->cpu);
-
-    if (!(addr & 0x04)) {
-        /* $FE80–$FE83: drive-select / control latch (b-em wd1770_wctl_acorn).
-         * bit 1 = drive select  (0=drive 0, 1=drive 1)
-         * bit 2 = side select   (0=side 0, 1=side 1)
-         * bit 3 = density       (0=FM, 1=MFM) */
-        m->fdc_latch    = val;
-        uint8_t drive   = (val >> 1) & 1;
-        uint8_t side    = (val >> 2) & 1;
-        uint8_t density = (val >> 3) & 1;
-        fprintf(stderr, "[fdc] W $%04X(latch)=%02X (drive=%d side=%d dens=%d) @ PC=$%04X\n",
-                addr, val, drive, side, density, pc);
-        wd1770_select(&m->fdc, drive, side, density);
-        return;
-    }
-
-    /* $FE84–$FE87: WD1770 chip registers */
-    uint8_t reg = addr & 0x03;
-    static const char *wnames[] = {"cmd","track","sector","data"};
-    fprintf(stderr, "[fdc] W $%04X(%s)=%02X @ PC=$%04X\n",
-            addr, wnames[reg], val, pc);
-    wd1770_write(&m->fdc, reg, val);
-}
-
-/* ROMSEL — &FE30: sideways ROM bank select */
-static uint8_t io_romsel_read(uint16_t addr, void *ctx) {
-    (void)addr;
-    bbc_machine_t *m = (bbc_machine_t *)ctx;
-    /* On real hardware ROMSEL is write-only; reads return floating bus.
-     * Return current value for debuggability. */
-    return bbc_memory_get_romsel(m->mem);
-}
-static void io_romsel_write(uint16_t addr, uint8_t val, void *ctx) {
-    (void)addr;
-    bbc_machine_t *m = (bbc_machine_t *)ctx;
-    bbc_memory_set_romsel(m->mem, val & 0x0F);
 }
 
 /* ======================================================================

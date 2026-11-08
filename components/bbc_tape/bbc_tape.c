@@ -3,8 +3,7 @@
  *
  * UEF format reference: http://electrem.emuunlim.com/UEFSpecs.htm
  *
- * We parse UEF at load time into a flat list of tape blocks.
- * Each UEF chunk 0x0100 = one BBC tape block (sync byte + header + data).
+ * We parse supported UEF chunks at load time into a flat list of tape blocks.
  *
  * The ACIA (MC6850-compatible Serial ULA) delivers bytes to the MOS.
  * Baud rate: 1200 baud = 1 byte per ~16667 cycles at 2 MHz.
@@ -25,17 +24,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <limits.h>
 #include "bbc_tape.h"
 
 #ifndef ESP_PLATFORM
 #  include <zlib.h>   /* for gzip decompression on host */
+#else
+#  include "esp32/rom/miniz.h"
 #endif
 
 #ifdef ESP_PLATFORM
 #  include "esp_log.h"
 #  define TAPE_LOGI(fmt, ...) ESP_LOGI("bbc_tape", fmt, ##__VA_ARGS__)
 #  define TAPE_LOGD(fmt, ...) ESP_LOGD("bbc_tape", fmt, ##__VA_ARGS__)
-#  define TAPE_LOGW(fmt, ...) ESP_LOGW("bbc_tape", fmt, ##__VA_ARGS__)
+#  define TAPE_LOGW(fmt, ...) printf("[tape] WARN: " fmt "\n", ##__VA_ARGS__)
 #else
 #  include <stdio.h>
 #  define TAPE_LOGI(fmt, ...) fprintf(stderr, "[tape] " fmt "\n", ##__VA_ARGS__)
@@ -43,11 +46,8 @@
 #  define TAPE_LOGW(fmt, ...) fprintf(stderr, "[tape] WARN: " fmt "\n", ##__VA_ARGS__)
 #endif
 
-/* Cycles per byte at 1200 baud, 2 MHz clock.
- * 1200 baud, 8N1 = 10 bits per byte → 2000000/1200/10 ≈ 167 cycles/bit
- * Actually BBC tape is 1200 baud with start+8data+1stop = 10 bits
- * so cycles_per_byte = 2000000 / 1200 ≈ 1667 */
-#define CYCLES_PER_BYTE  1667
+/* 1200 baud, 8N1: 10 bits per byte at the 2 MHz emulated CPU clock. */
+#define CYCLES_PER_BYTE  16667
 
 /* -------------------------------------------------------------------------
  * UEF helpers — little-endian reads from raw buffer
@@ -60,6 +60,95 @@ static uint32_t read_u32le(const uint8_t *p) {
                       ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24));
 }
 
+static uint32_t uef_crc32(const uint8_t *data, size_t size)
+{
+#ifdef ESP_PLATFORM
+    return (uint32_t)mz_crc32(0, data, size);
+#else
+    return (uint32_t)crc32(0, data, (uInt)size);
+#endif
+}
+
+static size_t uef_inflate_raw(uint8_t *out, size_t out_size,
+                              const uint8_t *data, size_t size)
+{
+#ifdef ESP_PLATFORM
+    tinfl_decompressor *state = (tinfl_decompressor *)malloc(sizeof(*state));
+    if (!state) {
+        TAPE_LOGW("cannot allocate gzip decompressor state");
+        return (size_t)-1;
+    }
+    tinfl_init(state);
+    size_t input_size = size, output_size = out_size;
+    tinfl_status status = tinfl_decompress(state, data, &input_size, out, out,
+                                           &output_size,
+                                           TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+    free(state);
+    return status == TINFL_STATUS_DONE ? output_size : (size_t)-1;
+#else
+    z_stream zs;
+    memset(&zs, 0, sizeof(zs));
+    zs.next_in = (Bytef *)data;
+    zs.avail_in = (uInt)size;
+    zs.next_out = out;
+    zs.avail_out = (uInt)out_size;
+    if (inflateInit2(&zs, -15) != Z_OK) return (size_t)-1;
+    int result = inflate(&zs, Z_FINISH);
+    size_t written = zs.total_out;
+    inflateEnd(&zs);
+    return result == Z_STREAM_END ? written : (size_t)-1;
+#endif
+}
+
+static uint8_t *uef_decompress_gzip(const uint8_t *raw, size_t size,
+                                    size_t *out_size)
+{
+    if (size < 18 || raw[2] != 8 || (raw[3] & 0xE0) != 0) {
+        TAPE_LOGW("invalid gzip header");
+        return NULL;
+    }
+    size_t pos = 10, end = size - 8;
+    uint8_t flags = raw[3];
+    if (flags & 4) {
+        if (end - pos < 2) return NULL;
+        size_t extra = read_u16le(raw + pos);
+        pos += 2;
+        if (extra > end - pos) return NULL;
+        pos += extra;
+    }
+    for (uint8_t bit = 8; bit <= 16; bit <<= 1) {
+        if (flags & bit) {
+            while (pos < end && raw[pos] != 0) ++pos;
+            if (pos == end) return NULL;
+            ++pos;
+        }
+    }
+    if (flags & 2) {
+        if (end - pos < 2 ||
+            (uef_crc32(raw, pos) & 0xFFFFu) != read_u16le(raw + pos))
+            return NULL;
+        pos += 2;
+    }
+    size_t expected = read_u32le(raw + end + 4);
+    if (expected < 12 || pos >= end || size > UINT_MAX) {
+        TAPE_LOGW("invalid gzip size or payload");
+        return NULL;
+    }
+    uint8_t *out = (uint8_t *)malloc(expected);
+    if (!out) {
+        TAPE_LOGW("cannot allocate %zu bytes for gzip UEF", expected);
+        return NULL;
+    }
+    size_t written = uef_inflate_raw(out, expected, raw + pos, end - pos);
+    if (written != expected || uef_crc32(out, written) != read_u32le(raw + end)) {
+        TAPE_LOGW("gzip decompression or CRC failed (expected=%zu, decoded=%zu)",
+                  expected, written);
+        free(out);
+        return NULL;
+    }
+    *out_size = written;
+    return out;
+}
 /* -------------------------------------------------------------------------
  * bbc_tape_init
  * ------------------------------------------------------------------------- */
@@ -93,79 +182,43 @@ void bbc_tape_free(bbc_tape_t *tape)
  * We store each 0x0100 chunk as one bbc_tape_block_t.
  * ------------------------------------------------------------------------- */
 /* -------------------------------------------------------------------------
- * uef_decompress — load file into memory, decompressing gzip if needed.
+ * uef_load_raw — load file into memory, decompressing gzip if needed.
  * Returns malloc'd buffer (caller must free) and sets *out_size.
  * Returns NULL on error.
  * ------------------------------------------------------------------------- */
 static uint8_t *uef_load_raw(const char *path, size_t *out_size)
 {
     FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
+    if (!f) {
+        TAPE_LOGW("cannot open %s (errno=%d)", path, errno);
+        return NULL;
+    }
 
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (sz < 12) { fclose(f); return NULL; }
+    if (sz < 12) {
+        TAPE_LOGW("file too small or cannot determine size: %s (%ld)", path, sz);
+        fclose(f); return NULL;
+    }
 
     uint8_t *raw = (uint8_t *)malloc((size_t)sz);
-    if (!raw) { fclose(f); return NULL; }
+    if (!raw) {
+        TAPE_LOGW("cannot allocate %ld bytes for %s", sz, path);
+        fclose(f); return NULL;
+    }
     if ((long)fread(raw, 1, (size_t)sz, f) != sz) {
+        TAPE_LOGW("cannot read complete file %s (errno=%d)", path, errno);
         free(raw); fclose(f); return NULL;
     }
     fclose(f);
 
     /* Check for gzip magic: 1F 8B */
     if (raw[0] == 0x1F && raw[1] == 0x8B) {
-#ifndef ESP_PLATFORM
-        /* Decompress using zlib inflate with gzip wrapper */
-        /* Estimate decompressed size: try 8× first, grow if needed */
-        size_t out_cap = (size_t)sz * 8;
-        if (out_cap < 65536) out_cap = 65536;
-        uint8_t *out_buf = (uint8_t *)malloc(out_cap);
-        if (!out_buf) { free(raw); return NULL; }
-
-        z_stream zs;
-        memset(&zs, 0, sizeof(zs));
-        zs.next_in  = raw;
-        zs.avail_in = (uInt)sz;
-
-        /* inflateInit2 with windowBits=47 = gzip + zlib auto-detect */
-        if (inflateInit2(&zs, 47) != Z_OK) {
-            free(out_buf); free(raw); return NULL;
-        }
-
-        zs.next_out  = out_buf;
-        zs.avail_out = (uInt)out_cap;
-
-        int ret = inflate(&zs, Z_FINISH);
-        if (ret == Z_BUF_ERROR || ret == Z_OK) {
-            /* Buffer too small — try larger */
-            size_t filled = out_cap - zs.avail_out;
-            out_cap *= 4;
-            uint8_t *bigger = (uint8_t *)realloc(out_buf, out_cap);
-            if (!bigger) { inflateEnd(&zs); free(out_buf); free(raw); return NULL; }
-            out_buf = bigger;
-            zs.next_out  = out_buf + filled;
-            zs.avail_out = (uInt)(out_cap - filled);
-            ret = inflate(&zs, Z_FINISH);
-        }
-
-        size_t decompressed = out_cap - zs.avail_out;
-        inflateEnd(&zs);
+        uint8_t *out = uef_decompress_gzip(raw, (size_t)sz, out_size);
         free(raw);
-
-        if (ret != Z_STREAM_END) {
-            TAPE_LOGW("gzip decompress failed (ret=%d)", ret);
-            free(out_buf); return NULL;
-        }
-
-        TAPE_LOGI("gzip decompressed %ld -> %zu bytes", sz, decompressed);
-        *out_size = decompressed;
-        return out_buf;
-#else
-        TAPE_LOGW("gzip UEF not supported on ESP32 (no zlib)");
-        free(raw); return NULL;
-#endif
+        if (!out) TAPE_LOGW("invalid or unsupported gzip UEF");
+        return out;
     }
 
     *out_size = (size_t)sz;
@@ -189,23 +242,52 @@ int bbc_tape_load_uef(bbc_tape_t *tape, const char *path)
     tape->uef_data = uef_data;
     tape->uef_size = uef_size;
 
-    /* Count valid blocks:
-     *   0x0100 data chunks (len >= 2 = at least sync + 1 byte)
-     *   0x0110 carrier tone chunks (synthesised as $DC bytes) */
+    /* Count data and synthetic carrier blocks before allocating them. */
     uint16_t n = 0;
     size_t pos = 12;
-    while (pos + 6 <= tape->uef_size) {
+    while (pos < tape->uef_size) {
+        if (tape->uef_size - pos < 6) {
+            TAPE_LOGW("truncated UEF chunk header in %s", path);
+            bbc_tape_free(tape); return -1;
+        }
         uint16_t chunk_id  = read_u16le(tape->uef_data + pos);
         uint32_t chunk_len = read_u32le(tape->uef_data + pos + 2);
         pos += 6;
-        if (chunk_id == UEF_CHUNK_DATA && chunk_len >= 2) {
-            n++;
-        } else if (chunk_id == UEF_CHUNK_CARRIER && chunk_len >= 2) {
-            /* Each carrier chunk becomes one synthetic carrier block */
-            uint16_t cycles = read_u16le(tape->uef_data + pos);
-            if (cycles / 20 >= 1) n++;  /* at least 1 byte worth */
+        if (chunk_len > tape->uef_size - pos) {
+            TAPE_LOGW("truncated UEF chunk in %s", path);
+            bbc_tape_free(tape); return -1;
         }
-        if (pos + chunk_len > tape->uef_size) break;
+        if ((chunk_id == UEF_CHUNK_DATA && chunk_len > BBC_TAPE_BLOCK_MAX) ||
+            (chunk_id == UEF_CHUNK_FORMAT_DATA && chunk_len > BBC_TAPE_BLOCK_MAX + 3)) {
+            TAPE_LOGW("UEF data chunk too large in %s", path);
+            bbc_tape_free(tape); return -1;
+        }
+        if (chunk_id == UEF_CHUNK_FORMAT_DATA &&
+            (chunk_len < 3 || tape->uef_data[pos] != 8 ||
+             tape->uef_data[pos + 1] != 'N' || tape->uef_data[pos + 2] != 1)) {
+            TAPE_LOGW("unsupported UEF data framing in %s", path);
+            bbc_tape_free(tape); return -1;
+        }
+        if (chunk_id == UEF_CHUNK_CARRIER_DUMMY && chunk_len < 4) {
+            TAPE_LOGW("truncated UEF carrier in %s", path);
+            bbc_tape_free(tape); return -1;
+        }
+        unsigned add = 0;
+        if ((chunk_id == UEF_CHUNK_DATA && chunk_len > 0) ||
+            (chunk_id == UEF_CHUNK_FORMAT_DATA && chunk_len > 3))
+            add = 1;
+        else if (chunk_id == UEF_CHUNK_CARRIER && chunk_len >= 2)
+            add = read_u16le(tape->uef_data + pos) >= 20;
+        else if (chunk_id == UEF_CHUNK_CARRIER_DUMMY)
+            add = 1 + (read_u16le(tape->uef_data + pos) >= 20) +
+                      (read_u16le(tape->uef_data + pos + 2) >= 20);
+        if (add) {
+            if (add > UINT16_MAX - n) {
+                TAPE_LOGW("too many UEF blocks in %s", path);
+                bbc_tape_free(tape); return -1;
+            }
+            n += add;
+        }
         pos += chunk_len;
     }
 
@@ -215,7 +297,10 @@ int bbc_tape_load_uef(bbc_tape_t *tape, const char *path)
     }
 
     tape->blocks = (bbc_tape_block_t *)calloc(n, sizeof(bbc_tape_block_t));
-    if (!tape->blocks) { bbc_tape_free(tape); return -1; }
+    if (!tape->blocks) {
+        TAPE_LOGW("cannot allocate %u UEF blocks", n);
+        bbc_tape_free(tape); return -1;
+    }
     tape->n_blocks = n;
 
     /* Second pass: fill blocks */
@@ -225,13 +310,30 @@ int bbc_tape_load_uef(bbc_tape_t *tape, const char *path)
         uint16_t chunk_id  = read_u16le(tape->uef_data + pos);
         uint32_t chunk_len = read_u32le(tape->uef_data + pos + 2);
         pos += 6;
-        if (chunk_id == UEF_CHUNK_DATA && chunk_len >= 2) {
-            uint16_t blen = (chunk_len > BBC_TAPE_BLOCK_MAX)
-                            ? BBC_TAPE_BLOCK_MAX
-                            : (uint16_t)chunk_len;
-            memcpy(tape->blocks[bi].data, tape->uef_data + pos, blen);
+        if ((chunk_id == UEF_CHUNK_DATA && chunk_len > 0) ||
+            (chunk_id == UEF_CHUNK_FORMAT_DATA && chunk_len > 3)) {
+            size_t prefix = chunk_id == UEF_CHUNK_FORMAT_DATA ? 3 : 0;
+            uint16_t blen = (uint16_t)(chunk_len - prefix);
+            memcpy(tape->blocks[bi].data, tape->uef_data + pos + prefix, blen);
             tape->blocks[bi].len = blen;
             bi++;
+        } else if (chunk_id == UEF_CHUNK_CARRIER_DUMMY) {
+            uint16_t before = read_u16le(tape->uef_data + pos) / 20;
+            uint16_t after = read_u16le(tape->uef_data + pos + 2) / 20;
+            if (before) {
+                if (before > BBC_TAPE_BLOCK_MAX) before = BBC_TAPE_BLOCK_MAX;
+                memset(tape->blocks[bi].data, 0xDC, before);
+                tape->blocks[bi].len = before;
+                tape->blocks[bi++].is_carrier = true;
+            }
+            tape->blocks[bi].data[0] = 0xAA;
+            tape->blocks[bi++].len = 1;
+            if (after) {
+                if (after > BBC_TAPE_BLOCK_MAX) after = BBC_TAPE_BLOCK_MAX;
+                memset(tape->blocks[bi].data, 0xDC, after);
+                tape->blocks[bi].len = after;
+                tape->blocks[bi++].is_carrier = true;
+            }
         } else if (chunk_id == UEF_CHUNK_CARRIER && chunk_len >= 2) {
             uint16_t cycles = read_u16le(tape->uef_data + pos);
             uint16_t nbytes = (uint16_t)(cycles / 20);

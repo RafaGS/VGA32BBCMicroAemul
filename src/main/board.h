@@ -56,10 +56,10 @@
  * These are the most likely values based on available GPIOs on WROVER-E,
  * but must be confirmed.
  * ----------------------------------------------------------------------- */
-#define BOARD_SD_MOSI  GPIO_NUM_13   /* VERIFY */
-#define BOARD_SD_MISO  GPIO_NUM_35   /* VERIFY — input only on ESP32 */
-#define BOARD_SD_CLK   GPIO_NUM_14   /* VERIFY */
-#define BOARD_SD_CS    GPIO_NUM_2    /* VERIFY */
+#define BOARD_SD_MOSI  GPIO_NUM_12
+#define BOARD_SD_MISO  GPIO_NUM_2
+#define BOARD_SD_CLK   GPIO_NUM_14
+#define BOARD_SD_CS    GPIO_NUM_13
 
 /* -----------------------------------------------------------------------
  * SD card mount point

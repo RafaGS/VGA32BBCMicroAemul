@@ -99,8 +99,8 @@ static void sysvia_update_latch(bbc_sysvia_t *sv, uint8_t portb_val)
 /* -------------------------------------------------------------------------
  * Internal: check whether sound chip write should fire
  *
- * On the BBC Model B the SN76489 is selected when IC32 bit 0 goes LOW while
- * the system VIA is writing to Port A (the slow data bus).
+ * The SN76489 is selected when IC32 bit 0 goes LOW while the System VIA
+ * writes to Port A (the slow data bus).
  * B-em fires the write at the falling edge of the sound WE bit.
  * ------------------------------------------------------------------------- */
 static void sysvia_check_sound(bbc_sysvia_t *sv, uint8_t old_latch)
@@ -169,8 +169,8 @@ static uint8_t sysvia_port_in(void *user_ctx, uint8_t port)
         uint8_t col = pa_out & 0x0F;
 
         /* Default: bit 7 = 0 (no key detected).
-         * BBC Model B: when KBD_WE (IC32 bit 3) is LOW and the key at
-         * (row, col) is pressed, bit 7 of the slow data bus is driven HIGH.
+         * When KBD_WE (IC32 bit 3) is LOW and the key at (row, col) is
+         * pressed, bit 7 of the slow data bus is driven HIGH.
          * The MOS reads this as: bit7=1 → key found; bit7=0 → not found. */
         uint8_t result = pa_out & 0x7Fu;  /* clear bit 7 by default */
 
@@ -187,13 +187,8 @@ static uint8_t sysvia_port_in(void *user_ctx, uint8_t port)
         return result;
     }
 
-    /* Port B */
-    uint8_t val = 0xFF;
-    /* PB4 = joystick fire 0 (active low) */
-    if (sv->joy_fire0) val &= ~0x10;
-    /* PB5 = joystick fire 1 (active low) */
-    if (sv->joy_fire1) val &= ~0x20;
-    return val;
+    /* No Model A circuit drives the User Port / ADC joystick inputs. */
+    return 0xFF;
 }
 
 static void sysvia_irq(void *user_ctx, bool state)
@@ -207,7 +202,7 @@ static void sysvia_irq(void *user_ctx, bool state)
 static void sysvia_control_out(void *user_ctx, uint8_t line, bool state)
 {
     /* CA2 (line==0) is driven by sysvia_update_ca2; ignore here.
-     * CB2 (line==1) is not used for motor control on Model B (motor is IC32 bit 2). */
+     * CB2 (line==1) is not used for motor control (motor is IC32 bit 2). */
     (void)user_ctx; (void)line; (void)state;
 }
 
@@ -236,8 +231,6 @@ void bbc_sysvia_reset(bbc_sysvia_t *sv)
 {
     m6522_reset(&sv->via);
     sv->latch     = 0;
-    sv->joy_fire0 = false;
-    sv->joy_fire1 = false;
     SV_LOGD("reset");
 }
 
@@ -260,18 +253,6 @@ void bbc_sysvia_vsync(bbc_sysvia_t *sv, bool state)
 {
     /* VSYNC from 6845 CRTC → CA1 of System VIA */
     m6522_set_ca1(&sv->via, state);
-}
-
-void bbc_sysvia_adc_eoc(bbc_sysvia_t *sv, bool state)
-{
-    /* ADC end-of-conversion → CB1 */
-    m6522_set_cb1(&sv->via, state);
-}
-
-void bbc_sysvia_set_joystick(bbc_sysvia_t *sv, bool fire0, bool fire1)
-{
-    sv->joy_fire0 = fire0;
-    sv->joy_fire1 = fire1;
 }
 
 uint8_t bbc_sysvia_get_latch(const bbc_sysvia_t *sv)

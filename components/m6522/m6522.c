@@ -22,6 +22,26 @@
 #include <string.h>
 #include "m6522.h"
 
+#if defined(BBC_MACHINE_PROFILE)
+#include <stdio.h>
+
+static inline uint32_t m6522_profile_ccount(void)
+{
+    uint32_t count;
+    __asm__ __volatile__("rsr %0, ccount" : "=a"(count));
+    return count;
+}
+
+static uint32_t m6522_prof_divider = 0;
+static uint32_t m6522_prof_samples = 0;
+
+static uint64_t m6522_prof_total = 0;
+static uint64_t m6522_prof_ctrl = 0;
+static uint64_t m6522_prof_t1 = 0;
+static uint64_t m6522_prof_t2 = 0;
+static uint64_t m6522_prof_pipe = 0;
+#endif
+
 #ifdef ESP_PLATFORM
 #  include "esp_log.h"
 #  define VIA_LOGD(fmt, ...) ESP_LOGD("m6522", fmt, ##__VA_ARGS__)
@@ -526,26 +546,161 @@ void m6522_write(m6522_t *via, uint8_t reg, uint8_t val)
     update_irq(via);
 }
 
+/* --------------------------------------------------------------------------
+ * Tick fast path (closed-form advance of the timers between events)
+ *
+ * In the steady state below, one iteration of the loop in m6522_tick() only
+ * does: T1.counter--, T2.counter-- (the count pipelines are re-filled to the
+ * same value).  Nothing else changes until T1 or T2 reaches 0xFFFF, so n such
+ * iterations can be applied at once.
+ *
+ * Required at the start of the span (all of them):
+ *   - t1.pip == t2.pip == 0x0003: count pipeline at its fixed point, no
+ *     reload pending (advance_pipelines() maps 0x0003 to itself);
+ *   - (ACR bit 5 may be set: in PB6 mode pb6_edge is constant false inside
+ *     tick() -- the PB pins cannot change during the call -- so T2 simply
+ *     does not count; see the span computation below);
+ *   - irq_pip == 0 and (IFR & IER & 0x7F) == 0: nothing can enter or leave
+ *     the IRQ pipeline;
+ *   - no *_triggered flag pending (update_control_lines() would act).
+ * The span length is min(remaining, T1.counter, T2.counter), so it never
+ * contains the cycle in which a counter wraps to 0xFFFF; T2 does not limit
+ * the span once t2.t_bit is set (its later wraps have no effect).  In PB6
+ * mode T2 does not move at all and the span is refused only when
+ * T2.counter == 0xFFFF with t2.t_bit clear (the flag would be set on the
+ * first cycle).  The wrap cycle itself and everything after it run through
+ * the normal loop body.
+ *
+ * Port A is refreshed once per m6522_tick() call, after the loop.
+ * Build with -DM6522_FAST_TICK=0 to disable.  -DM6522_STATS adds counters.
+ * -------------------------------------------------------------------------- */
+#ifndef M6522_FAST_TICK
+#define M6522_FAST_TICK 1
+#endif
+
+/* Runtime switch for A/B measurements inside ONE binary (identical code and
+ * memory layout).  Always present; only consulted when M6522_FAST_TICK != 0. */
+volatile bool m6522_fast_enable = true;
+
+#ifdef M6522_STATS
+uint32_t m6522_stat_fast_cycles = 0;
+uint32_t m6522_stat_slow_cycles = 0;
+#endif
+
+#if M6522_FAST_TICK
+static inline bool tick_fast_ok(const m6522_t *via)
+{
+    return via->t1.pip == 0x0003 && via->t2.pip == 0x0003 &&
+           via->irq_pip == 0 &&
+           (via->ifr & via->ier & 0x7F) == 0 &&
+           !(via->pa.c1_triggered | via->pa.c2_triggered |
+             via->pb.c1_triggered | via->pb.c2_triggered);
+}
+#endif
+
 void m6522_tick(m6522_t *via, int32_t cycles)
 {
-    /* Track PB6 state for T2 pulse counting */
-    uint8_t pb_old = port_pins_pb7(via);
+   
+    /* PB6 edges matter only when T2 counts external pulses. */
+    const bool t2_count_pb6 =
+        (via->acr & M6522_ACR_T2_COUNT_PB6) != 0;
+
+    uint8_t pb_old = 0;
+    if (t2_count_pb6) {
+        pb_old = port_pins_pb7(via);
+    }
 
     for (int32_t i = 0; i < cycles; i++) {
-        /* Refresh port A input from callback (live mode, no latch) */
-        if (!(via->acr & M6522_ACR_PA_LATCH) && via->cb.port_in)
-            via->pa.inpr = via->cb.port_in(via->cb.user_ctx, 0);
+#if M6522_FAST_TICK
+        if (m6522_fast_enable && tick_fast_ok(via)) {
+            const bool pb6 = (via->acr & M6522_ACR_T2_COUNT_PB6) != 0;
+            int32_t n = cycles - i;
+            if (n > (int32_t)via->t1.counter)
+                n = (int32_t)via->t1.counter;
+            if (pb6) {
+                if (via->t2.counter == 0xFFFF && !via->t2.t_bit)
+                    n = 0;
+            } else if (!via->t2.t_bit && n > (int32_t)via->t2.counter) {
+                n = (int32_t)via->t2.counter;
+            }
+            if (n > 0) {
+                via->t1.counter = (uint16_t)(via->t1.counter - n);
+                via->t1.t_out   = false;
+                if (!pb6)
+                    via->t2.counter = (uint16_t)(via->t2.counter - n);
+                via->t2.t_out   = (via->t2.counter == 0xFFFF);
+#ifdef M6522_STATS
+                m6522_stat_fast_cycles += (uint32_t)n;
+#endif
+                i += n - 1;     /* the for-loop adds the last one */
+                continue;
+            }
+        }
+#endif
+#ifdef M6522_STATS
+        m6522_stat_slow_cycles++;
+#endif
+#if defined(BBC_MACHINE_PROFILE)
+        const bool prof_sample =
+            ((++m6522_prof_divider & 63u) == 0u);
 
-        /* Control line edge detection */
+        uint32_t prof_iter_start = 0;
+        uint32_t prof_mark = 0;
+        uint32_t prof_now = 0;
+
+        if (prof_sample)
+            prof_iter_start = m6522_profile_ccount();
+#endif
+
+#if defined(BBC_MACHINE_PROFILE)
+        if (prof_sample)
+            prof_mark = m6522_profile_ccount();
+#endif
+
         update_control_lines(via);
 
-        /* PB6 falling edge detection for T2 */
-        uint8_t pb_now = port_pins_pb7(via);
-        bool pb6_edge  = (pb_old & 0x40) && !(pb_now & 0x40);
-        pb_old         = pb_now;
+#if defined(BBC_MACHINE_PROFILE)
+        if (prof_sample) {
+            prof_now = m6522_profile_ccount();
+            m6522_prof_ctrl += (uint32_t)(prof_now - prof_mark);
+        }
+#endif
+
+        bool pb6_edge = false;
+
+        if (t2_count_pb6) {
+            uint8_t pb_now = port_pins_pb7(via);
+            pb6_edge = (pb_old & 0x40) && !(pb_now & 0x40);
+            pb_old = pb_now;
+        }
+
+#if defined(BBC_MACHINE_PROFILE)
+        if (prof_sample)
+            prof_mark = m6522_profile_ccount();
+#endif
 
         tick_t1(via);
+
+#if defined(BBC_MACHINE_PROFILE)
+        if (prof_sample) {
+            prof_now = m6522_profile_ccount();
+            m6522_prof_t1 += (uint32_t)(prof_now - prof_mark);
+        }
+#endif
+
+#if defined(BBC_MACHINE_PROFILE)
+        if (prof_sample)
+            prof_mark = m6522_profile_ccount();
+#endif
+
         tick_t2(via, pb6_edge);
+
+#if defined(BBC_MACHINE_PROFILE)
+        if (prof_sample) {
+            prof_now = m6522_profile_ccount();
+            m6522_prof_t2 += (uint32_t)(prof_now - prof_mark);
+        }
+#endif
 
         /* IRQ pipeline: set bit 7 of IFR after 1-cycle delay */
         if (via->irq_pip & 0x01) {
@@ -557,7 +712,64 @@ void m6522_tick(m6522_t *via, int32_t cycles)
             }
         }
 
+#if defined(BBC_MACHINE_PROFILE)
+        if (prof_sample)
+            prof_mark = m6522_profile_ccount();
+#endif
+
         advance_pipelines(via);
+
+#if defined(BBC_MACHINE_PROFILE)
+        if (prof_sample) {
+            prof_now = m6522_profile_ccount();
+            m6522_prof_pipe += (uint32_t)(prof_now - prof_mark);
+
+            m6522_prof_total +=
+                (uint32_t)(prof_now - prof_iter_start);
+
+            if (++m6522_prof_samples >= 8192u) {
+                uint64_t other = m6522_prof_total
+                    - m6522_prof_ctrl
+                    - m6522_prof_t1
+                    - m6522_prof_t2
+                    - m6522_prof_pipe;
+
+                fprintf(stderr,
+                    "[via-prof] avg CC/tick"
+                    " TOTAL=%llu CTRL=%llu T1=%llu"
+                    " T2=%llu PIPE=%llu OTHER=%llu n=%u\n",
+                    (unsigned long long)(
+                        m6522_prof_total / m6522_prof_samples),
+                    (unsigned long long)(
+                        m6522_prof_ctrl / m6522_prof_samples),
+                    (unsigned long long)(
+                        m6522_prof_t1 / m6522_prof_samples),
+                    (unsigned long long)(
+                        m6522_prof_t2 / m6522_prof_samples),
+                    (unsigned long long)(
+                        m6522_prof_pipe / m6522_prof_samples),
+                    (unsigned long long)(
+                        other / m6522_prof_samples),
+                    (unsigned)m6522_prof_samples);
+
+                m6522_prof_total = 0;
+                m6522_prof_ctrl = 0;
+                m6522_prof_t1 = 0;
+                m6522_prof_t2 = 0;
+                m6522_prof_pipe = 0;
+                m6522_prof_samples = 0;
+            }
+        }
+#endif
+    }
+    /*
+     * Refresh live port A once per batch.
+     * CPU reads of ORA still sample the callback in reg_read().
+     */
+    if (cycles > 0 &&
+            !(via->acr & M6522_ACR_PA_LATCH) &&
+            via->cb.port_in) {
+        via->pa.inpr = via->cb.port_in(via->cb.user_ctx, 0);
     }
 
     update_irq(via);

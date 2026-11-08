@@ -168,8 +168,12 @@ RENDER_IRAM void saa5050_start_row(saa5050_t *tt, uint8_t row_num)
 
 RENDER_IRAM void saa5050_end_row(saa5050_t *tt)
 {
-    /* Latch: double_high2 ← double_high1 */
-    tt->double_high2 = tt->double_high1;
+    /* Latch: a row that contains a double-height code makes the NEXT row the
+     * bottom half of the pair, but only if this row was itself a top half.
+     * Teletext pages carry the code on both rows of a pair; without the
+     * "&& !double_high2" the row after the pair was also drawn as a bottom
+     * half and came out blank. */
+    tt->double_high2 = tt->double_high1 && !tt->double_high2;
 }
 
 /* --------------------------------------------------------------------------

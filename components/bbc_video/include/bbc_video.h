@@ -6,7 +6,8 @@
  * Usage (frame-at-a-time mode — recommended for ESP32):
  *
  *   bbc_video_t video;
- *   bbc_video_init(&video, system_ram, 32768);
+ *   bbc_video_init(&video, system_ram, 16384);  // Model A
+ *   bbc_video_init(&video, system_ram, 32768);  // Model B
  *
  *   // Configure a 640×256 RGB565 framebuffer in PSRAM:
  *   static uint16_t fb[640 * 256];
@@ -71,13 +72,14 @@ typedef struct {
 } bbc_video_output_t;
 
 /* --------------------------------------------------------------------------
- * BBC Micro screen base addresses (Model B 32 KB)
+ * CRTC memory-space addresses used by the BBC's address translator
  * -------------------------------------------------------------------------- */
 #define BBC_SCREEN_BASE_MODE012  0x3000u  /* 20 KB: MODEs 0,1,2              */
 #define BBC_SCREEN_BASE_MODE3    0x4000u  /* 16 KB: MODE 3                   */
 #define BBC_SCREEN_BASE_MODE45   0x5800u  /* 10 KB: MODEs 4,5                */
 #define BBC_SCREEN_BASE_MODE6    0x6000u  /*  8 KB: MODE 6                   */
-#define BBC_SCREEN_BASE_MODE7    0x7C00u  /*  1 KB: MODE 7 Teletext          */
+#define BBC_SCREEN_BASE_MODE7_MODEL_A 0x3C00u /* Model A: only 16 KiB RAM */
+#define BBC_SCREEN_BASE_MODE7         0x7C00u /* Model B: upper RAM bank    */
 
 /* --------------------------------------------------------------------------
  * Full video subsystem state — no heap allocation
@@ -90,6 +92,8 @@ typedef struct {
     /* System RAM pointer (owned by bbc_memory, not by this struct) */
     const uint8_t  *system_ram;
     uint32_t        ram_size;
+    bool            scroll_c0;    /* IC32 Q4, address-wrap control */
+    bool            scroll_c1;    /* IC32 Q5, address-wrap control */
 
     /* Output configuration */
     bbc_video_output_t output;
@@ -132,6 +136,9 @@ uint8_t bbc_video_crtc_read (bbc_video_t *video, uint8_t addr);
 
 /* CPU bus access — Video ULA (&FE20-&FE21) */
 void bbc_video_vidproc_write(bbc_video_t *video, uint8_t addr, uint8_t data);
+
+/* Update IC32 C0/C1 video address-wrap signals from the System VIA latch. */
+void bbc_video_set_scroll_control(bbc_video_t *video, bool c0, bool c1);
 
 /*
  * Tick — advance one CRTC clock cycle.
@@ -182,6 +189,25 @@ void bbc_video_render_row(const bbc_video_t *video,
  * After rendering, fires the frame_cb if installed.
  */
 void bbc_video_render_frame(bbc_video_t *video);
+
+/*
+ * Render Mode 7's 480 x 250 content band as two colour indices per byte.
+ * The left pixel occupies bits 6:4, the right pixel bits 2:0. The destination
+ * must contain 250 rows of at least 240 bytes, with stride >= 240. This does
+ * not change the configured framebuffer. Returns false for invalid input or
+ * when teletext mode is not active.
+ */
+bool bbc_video_render_mode7_packed(bbc_video_t *video,
+                                   uint8_t *pixels, uint32_t stride);
+
+/* Bitmap frames use eight 3-bit physical colour indices per three bytes,
+ * most significant pixel first, at 640 x 256. The caller supplies 256 rows
+ * with stride >= BBC_BITMAP_PACKED_STRIDE. */
+#define BBC_BITMAP_PACKED_WIDTH 640
+#define BBC_BITMAP_PACKED_HEIGHT 256
+#define BBC_BITMAP_PACKED_STRIDE (BBC_BITMAP_PACKED_WIDTH * 3 / 8)
+bool bbc_video_render_bitmap_packed(bbc_video_t *video,
+                                    uint8_t *pixels, uint32_t stride);
 
 /*
  * Flash toggle — call at ~1 Hz (or every 50 calls to a 50 Hz frame tick).
