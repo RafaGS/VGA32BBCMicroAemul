@@ -1,3 +1,3 @@
-# ESP-Beep
+# VGA32BBCMicroAemul
 
-BBC Micro emulator for the ESP32 microcontroler
+BBC Micro Model A emulator for the TTgo VGA32 board.
