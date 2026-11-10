@@ -102,6 +102,13 @@ static inline bool bbc_bitmap_mode_supported(const bbc_video_t *video)
     return video->scroll_c0;
 }
 
+static inline int bbc_bitmap_scans_per_char(const mc6845_t *crtc)
+{
+    /* Mode 6 sets R9=9, but only RA 0-7 carry bitmap pixels. */
+    int scans = (int)crtc->max_scanline_addr + 1;
+    return scans > 8 ? 8 : scans;
+}
+
 /* Resolve a MODE 7 character address using the CRTC's live screen start.
  * MOS scrolls MODE 7 by advancing R12/R13; a fixed &3C00/&7C00 base
  * renders the old page and makes the prompt jump when the screen wraps.
@@ -303,7 +310,7 @@ static void render_bitmap_frame(bbc_video_t *video)
     uint16_t start_addr = mc6845_get_start_addr(crtc);
     int chars_per_line = (int)crtc->h_displayed;
     int char_rows = (int)crtc->v_displayed;
-    int scans_per_char = (int)(crtc->max_scanline_addr + 1);
+    int scans_per_char = bbc_bitmap_scans_per_char(crtc);
     uint16_t cursor_addr = mc6845_get_cursor_addr(crtc);
     int cursor_start = (int)(crtc->cursor_start & 0x1F);
     int cursor_end = (int)(crtc->cursor_end & 0x1F);
@@ -501,7 +508,7 @@ static RENDER_IRAM void render_bitmap_row(const bbc_video_t *video,
     uint16_t start_addr   = mc6845_get_start_addr(crtc);
     int chars_per_line    = (int)crtc->h_displayed;
     int char_rows         = (int)crtc->v_displayed;
-    int scans_per_char    = (int)(crtc->max_scanline_addr + 1);
+    int scans_per_char    = bbc_bitmap_scans_per_char(crtc);
     uint16_t cursor_addr  = mc6845_get_cursor_addr(crtc);
     int cursor_start      = (int)(crtc->cursor_start & 0x1F);
     int cursor_end        = (int)(crtc->cursor_end   & 0x1F);

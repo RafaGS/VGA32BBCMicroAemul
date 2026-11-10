@@ -56,7 +56,7 @@
  * emulator tasks (Core 0), read by the 1 Hz report in videoRenderTask;
  * races are benign (statistics only). */
 #ifndef VIDEO_DIAG
-#define VIDEO_DIAG 1
+#define VIDEO_DIAG 0
 #endif
 
 static volatile uint32_t s_vga_cb_calls = 0;
@@ -77,6 +77,9 @@ static volatile uint32_t s_vid_published = 0;    /* frames published         */
 static volatile uint32_t s_vid_render_us_sum = 0;
 static volatile uint32_t s_vid_render_us_max = 0;
 static volatile uint32_t s_emu_busy_us = 0;      /* time spent executing CPU */
+static volatile int s_vga_src_at_last = -1;
+static volatile uint8_t s_vga_display_at_last = 0xFF;
+static volatile unsigned s_vga_red_pixels_at_last = 0;
 
 static inline uint32_t IRAM_ATTR diag_ccount(void)
 {
@@ -217,6 +220,8 @@ static BbcKeyPos vk_to_bbc(fabgl::VirtualKey vk)
     case VK_PERCENT:                                  return {1, 3}; /* Shift+5 */
     case VK_AMPERSAND:                                return {3, 4}; /* Shift+6 */
     case VK_QUOTEDBL:                                 return {3, 1}; /* Shift+2 */
+    case VK_LEFTPAREN:                                return {1, 5}; /* Shift+8 */
+    case VK_RIGHTPAREN:                               return {2, 6}; /* Shift+9 */
     default:                                          return {0xFF, 0xFF};
     }
 }
@@ -302,7 +307,7 @@ static void mountDefaultTape(bbc_machine_t *m)
  * VGADirectController draw-scanline callback (IRAM, Core 1 ISR context)
  * ----------------------------------------------------------------------- */
 /* VGA is 640×480.  BBC native output is 640×256 (1:1 horizontally).
- * Vertical mapping: 256 BBC rows → 480 VGA lines (nearest-neighbour ×1.875).
+ * Bitmap output is scaled into the vertical viewport with black margins.
  *
  * The render task snapshots video state and RAM outside the ISR. Completed
  * frames are swapped only at a VGA frame boundary.
@@ -399,9 +404,15 @@ static void IRAM_ATTR draw_scanline_impl(
         return;
     }
 
+    const int32_t source_y = vga_bitmap_viewport_source_y(
+        (uint32_t)scanLine, BBC_BITMAP_PACKED_HEIGHT, VGA_OUT_HEIGHT);
+    if (source_y < 0) {
+        memset(dest, s_sig[0], BBC_BUF_W);
+        return;
+    }
+
     const uint8_t *src = s_packed_fb[display] +
-        (size_t)(scanLine * BBC_BITMAP_PACKED_HEIGHT / VGA_OUT_HEIGHT) *
-        BBC_BITMAP_PACKED_STRIDE;
+        (size_t)source_y * BBC_BITMAP_PACKED_STRIDE;
     for (int x = 0; x < BBC_BUF_W; x += 8) {
         vga_bitmap_expand8((uint16_t *)(dest + x), src, s_bitmap_pairs);
         src += 3;
@@ -421,6 +432,15 @@ static void IRAM_ATTR draw_scanline(
     draw_scanline_impl(arg, dest, scanLine);
 
     const uint32_t dt = diag_ccount() - t0;
+    if (scanLine == VGA_OUT_HEIGHT - (int)VGA_BITMAP_MARGIN_Y - 1) {
+        s_vga_src_at_last = (int)vga_bitmap_viewport_source_y(
+            (uint32_t)scanLine, BBC_BITMAP_PACKED_HEIGHT, VGA_OUT_HEIGHT);
+        s_vga_display_at_last = s_fb_display;
+        unsigned red_pixels = 0;
+        for (int x = 0; x < BBC_BUF_W; ++x)
+            red_pixels += dest[x ^ 2] == s_sig[1];
+        s_vga_red_pixels_at_last = red_pixels;
+    }
 
     s_vga_cb_calls = s_vga_cb_calls + 1;
     if (scanLine == 0) s_vga_line0_calls = s_vga_line0_calls + 1;
@@ -729,6 +749,7 @@ static void videoRenderTask(void *arg)
 
     for (;;) {
         uint8_t back;
+        static uint32_t last_bitmap_diag_ms[2] = {0, 0};
 
         // No sobrescribir un fotograma que aún está pendiente
         // de ser adoptado por el callback VGA.
@@ -873,6 +894,21 @@ static void videoRenderTask(void *arg)
             s_vid_render_us_sum = s_vid_render_us_sum + us;
             if (us > s_vid_render_us_max) s_vid_render_us_max = us;
             s_vid_published = s_vid_published + 1;
+
+            const uint32_t diag_now = millis();
+            if (!mode7 && diag_now - last_bitmap_diag_ms[back] >= 1000) {
+                printf("[fbdiag] rendered=%u R6=%u R9=%u start=%04X "
+                       "vga%u=src%d/fb%u/red%u\n",
+                       (unsigned)back,
+                       (unsigned)s_render_video.crtc.v_displayed,
+                       (unsigned)s_render_video.crtc.max_scanline_addr,
+                       (unsigned)mc6845_get_start_addr(&s_render_video.crtc),
+                       (unsigned)(VGA_OUT_HEIGHT - VGA_BITMAP_MARGIN_Y - 1),
+                       (int)s_vga_src_at_last,
+                       (unsigned)s_vga_display_at_last,
+                       s_vga_red_pixels_at_last);
+                last_bitmap_diag_ms[back] = diag_now;
+            }
         }
 #endif
 
