@@ -1,0 +1,5 @@
+10 MODE 5
+20 FOR colour = 0 TO 16
+30 GCOL 0,colour
+40 DRAW RND(1280),RND(1024)
+50 NEXT colour
